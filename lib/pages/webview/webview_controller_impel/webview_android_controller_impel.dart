@@ -8,6 +8,9 @@ import 'package:flutter_inappwebview_platform_interface/flutter_inappwebview_pla
 import 'package:flutter_inappwebview_android/flutter_inappwebview_android.dart'
     as android_webview;
 
+/// This implementation class behaves completely differently from others. It thoroughly destroys the WebView instance
+/// every time a page is unloaded, and recreates the WebView instance every time a new URL is loaded,
+/// to avoid the issue where specific OEM vendors (Honor/Vivo/OnePlus) on Android 15+ versions continuously leak GPU fences when the WebView has no rendering target until fd exhaustion causes crashes. 
 class WebviewAndroidItemControllerImpel
     extends WebviewItemController<PlatformInAppWebViewController> {
   PlatformHeadlessInAppWebView? headlessWebView;
@@ -16,45 +19,106 @@ class WebviewAndroidItemControllerImpel
   bool shouldInjectIframeRedirect = false;
   bool useNativePlayer = false;
 
+  // Internal loading state management, only for Android
+  bool _isDisposed = true;
+  bool _isInitializing = false;
+  bool _isDisposing = false;
+  Completer<void>? _initCompleter;
+  Completer<void>? _disposeCompleter;
+
+  bool get isWebViewReady =>
+      !_isDisposed &&
+      !_isInitializing &&
+      !_isDisposing &&
+      webviewController != null;
+
   @override
   Future<void> init() async {
-    await _setupProxy();
-    headlessWebView ??= PlatformHeadlessInAppWebView(
-      PlatformHeadlessInAppWebViewCreationParams(
-        initialSettings: InAppWebViewSettings(
-          userAgent: Utils.getRandomUA(),
-          mediaPlaybackRequiresUserGesture: true,
-          cacheEnabled: false,
-          blockNetworkImage: true,
-          loadsImagesAutomatically: false,
-          upgradeKnownHostsToHTTPS: false,
-          safeBrowsingEnabled: false,
-          mixedContentMode: MixedContentMode.MIXED_CONTENT_COMPATIBILITY_MODE,
-          geolocationEnabled: false,
+    if (_isDisposing && _disposeCompleter != null) {
+      await _disposeCompleter!.future;
+    }
+
+    if (!_isDisposed && webviewController != null) {
+      return;
+    }
+
+    if (_isInitializing && _initCompleter != null) {
+      await _initCompleter!.future;
+      return;
+    }
+
+    _isInitializing = true;
+    _initCompleter = Completer<void>();
+
+    try {
+      await _setupProxy();
+
+      final completer = Completer<void>();
+
+      headlessWebView = PlatformHeadlessInAppWebView(
+        PlatformHeadlessInAppWebViewCreationParams(
+          initialSettings: InAppWebViewSettings(
+            userAgent: Utils.getRandomUA(),
+            mediaPlaybackRequiresUserGesture: true,
+            cacheEnabled: false,
+            blockNetworkImage: true,
+            loadsImagesAutomatically: false,
+            upgradeKnownHostsToHTTPS: false,
+            safeBrowsingEnabled: false,
+            mixedContentMode: MixedContentMode.MIXED_CONTENT_COMPATIBILITY_MODE,
+            geolocationEnabled: false,
+          ),
+          onWebViewCreated: (controller) {
+            print('[WebView] Created');
+            webviewController = controller;
+            if (!completer.isCompleted) {
+              completer.complete();
+            }
+            initEventController.add(true);
+          },
+          onLoadStart: (controller, url) async {
+            logEventController.add('started loading: $url');
+            if (url.toString() != 'about:blank') {
+              await onLoadStart();
+            }
+          },
+          onLoadStop: (controller, url) {
+            logEventController.add('loading completed: $url');
+          },
         ),
-        onWebViewCreated: (controller) {
-          print('[WebView] Created');
-          webviewController = controller;
-          initEventController.add(true);
-        },
-        onLoadStart: (controller, url) async {
-          logEventController.add('started loading: $url');
-          if (url.toString() != 'about:blank') {
-            await onLoadStart();
-          }
-        },
-        onLoadStop: (controller, url) {
-          logEventController.add('loading completed: $url');
-        },
-      ),
-    );
-    await headlessWebView?.run();
+      );
+
+      await headlessWebView?.run();
+      await completer.future;
+
+      _isDisposed = false;
+      hasInjectedScripts = false;
+    } finally {
+      _isInitializing = false;
+      if (_initCompleter != null && !_initCompleter!.isCompleted) {
+        _initCompleter!.complete();
+      }
+    }
   }
 
   @override
   Future<void> loadUrl(String url, bool useNativePlayer, bool useLegacyParser,
       {int offset = 0}) async {
-    await unloadPage();
+    if (_isDisposing && _disposeCompleter != null) {
+      await _disposeCompleter!.future;
+    }
+
+    if (_isDisposed || webviewController == null) {
+      await init();
+    }
+
+    if (!isWebViewReady) {
+      logEventController.add('WebView not ready, aborting loadUrl');
+      return;
+    }
+
+    loadingMonitorTimer?.cancel();
+
     if (!hasInjectedScripts) {
       addJavaScriptHandlers(useNativePlayer, useLegacyParser);
       await addUserScripts(useNativePlayer, useLegacyParser);
@@ -68,9 +132,14 @@ class WebviewAndroidItemControllerImpel
     this.useNativePlayer = useNativePlayer;
     videoLoadingEventController.add(true);
 
+    if (!isWebViewReady) {
+      logEventController.add('WebView disposed during setup, aborting loadUrl');
+      return;
+    }
+
     await webviewController?.loadUrl(urlRequest: URLRequest(url: WebUri(url)));
     loadingMonitorTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
-      if (isVideoSourceLoaded || isIframeLoaded) {
+      if (isVideoSourceLoaded || isIframeLoaded || _isDisposed) {
         timer.cancel();
       } else {
         count++;
@@ -371,16 +440,46 @@ class WebviewAndroidItemControllerImpel
   @override
   Future<void> unloadPage() async {
     loadingMonitorTimer?.cancel();
-    await webviewController!
-        .loadUrl(urlRequest: URLRequest(url: WebUri("about:blank")));
+    loadingMonitorTimer = null;
+
+    if (_isDisposing || _isDisposed) {
+      return;
+    }
+
+    if (_isInitializing && _initCompleter != null) {
+      await _initCompleter!.future;
+    }
+
+    _isDisposing = true;
+    _disposeCompleter = Completer<void>();
+
+    try {
+      await headlessWebView?.dispose();
+      headlessWebView = null;
+      webviewController = null;
+      hasInjectedScripts = false;
+      _isDisposed = true;
+    } finally {
+      _isDisposing = false;
+      if (_disposeCompleter != null && !_disposeCompleter!.isCompleted) {
+        _disposeCompleter!.complete();
+      }
+    }
   }
 
   @override
   void dispose() {
     loadingMonitorTimer?.cancel();
+    loadingMonitorTimer = null;
+
+    _isDisposed = true;
+    _isDisposing = false;
+    _isInitializing = false;
+
     headlessWebView?.dispose();
     headlessWebView = null;
     webviewController = null;
+    hasInjectedScripts = false;
   }
 
   Future<void> _setupProxy() async {
